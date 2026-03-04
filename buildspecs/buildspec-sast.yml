@@ -1,0 +1,118 @@
+version: 0.2
+
+env:
+  variables:
+    SEMGREP_APP_TOKEN: ""  # Optional: for Semgrep Cloud
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+      nodejs: 18
+    commands:
+      - echo "Installing SAST tools..."
+      - pip3 install --upgrade pip
+      - pip3 install semgrep bandit
+      - npm install -g eslint eslint-plugin-security
+      
+  pre_build:
+    commands:
+      - echo "Starting SAST scans at $(date)"
+      - SCAN_START_TIME=$(date +%s)
+      
+  build:
+    commands:
+      - echo "Running Semgrep (multi-language SAST)..."
+      - |
+        semgrep --config=auto \
+          --json \
+          --output=semgrep-report.json \
+          --metrics=off \
+          src/ || true
+      
+      - echo "Analyzing Semgrep results..."
+      - |
+        CRITICAL_COUNT=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep-report.json)
+        HIGH_COUNT=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' semgrep-report.json)
+        
+        echo "SAST Results:"
+        echo "  CRITICAL: $CRITICAL_COUNT"
+        echo "  HIGH: $HIGH_COUNT"
+        
+        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          echo "❌ FAILED: Found $CRITICAL_COUNT critical security issues"
+          jq -r '.results[] | select(.extra.severity == "ERROR") | "  - \(.check_id): \(.extra.message) (\(.path):\(.start.line))"' semgrep-report.json
+          exit 1
+        fi
+        
+        if [ "$HIGH_COUNT" -gt 10 ]; then
+          echo "⚠️  WARNING: Found $HIGH_COUNT high severity issues (threshold: 10)"
+        fi
+      
+      - echo "Running Bandit (Python-specific)..."
+      - |
+        find src/ -name "*.py" -type f > python_files.txt
+        if [ -s python_files.txt ]; then
+          bandit -r src/ -f json -o bandit-report.json || true
+          
+          BANDIT_HIGH=$(jq '[.results[] | select(.issue_severity == "HIGH")] | length' bandit-report.json)
+          echo "Bandit High Severity: $BANDIT_HIGH"
+          
+          if [ "$BANDIT_HIGH" -gt 5 ]; then
+            echo "⚠️  WARNING: Bandit found $BANDIT_HIGH high severity issues"
+          fi
+        else
+          echo "No Python files found, skipping Bandit"
+        fi
+      
+      - echo "Running ESLint (Node.js services)..."
+      - |
+        for dir in src/*/; do
+          if [ -f "$dir/package.json" ]; then
+            echo "Scanning $(basename $dir)..."
+            cd $dir
+            npm install --only=dev 2>/dev/null || true
+            
+            # Create ESLint config if not exists
+            if [ ! -f ".eslintrc.json" ]; then
+              cat > .eslintrc.json <<'ESLINT_EOF'
+{
+  "env": {
+    "node": true,
+    "es2021": true
+  },
+  "extends": ["eslint:recommended"],
+  "plugins": ["security"],
+  "rules": {
+    "security/detect-object-injection": "error",
+    "security/detect-non-literal-regexp": "warn",
+    "security/detect-unsafe-regex": "error"
+  }
+}
+ESLINT_EOF
+            fi
+            
+            npx eslint . --format json --output-file ../../eslint-$(basename $dir).json 2>/dev/null || true
+            cd - > /dev/null
+          fi
+        done
+      
+  post_build:
+    commands:
+      - SCAN_END_TIME=$(date +%s)
+      - SCAN_DURATION=$((SCAN_END_TIME - SCAN_START_TIME))
+      - echo "✅ SAST scan completed in ${SCAN_DURATION} seconds"
+      - echo "Reports generated - uploading to S3..."
+
+artifacts:
+  files:
+    - semgrep-report.json
+    - bandit-report.json
+    - eslint-*.json
+  name: SASTArtifacts
+
+reports:
+  sast_semgrep:
+    files:
+      - semgrep-report.json
+    file-format: "SEMGREPJSON"

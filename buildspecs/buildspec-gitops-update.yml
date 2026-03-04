@@ -1,0 +1,39 @@
+version: 0.2
+
+env:
+  variables:
+    GITOPS_REPO: "WILL_BE_CONFIGURED_LATER"
+    TARGET_ENV: "dev"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Configuring Git..."
+      - git config --global user.email "devops@finsecure.com"
+      - git config --global user.name "AWS CodeBuild"
+      
+  build:
+    commands:
+      - echo "Reading image manifest..."
+      - |
+        if [ ! -f "image-manifest.json" ]; then
+          echo "❌ image-manifest.json not found"
+          exit 1
+        fi
+        
+        COMMIT_HASH=$(jq -r '.commit' image-manifest.json)
+        echo "Deploying commit: $COMMIT_HASH to $TARGET_ENV"
+      
+      - echo "GitOps update will be implemented in Day 3"
+      - echo "For now, just displaying the manifest:"
+      - cat image-manifest.json
+      
+  post_build:
+    commands:
+      - echo "✅ GitOps update stage completed"
+      - echo "Image tags ready for deployment via Argo CD"
+
+artifacts:
+  files:
+    - image-manifest.json
+  name: GitOpsArtifacts

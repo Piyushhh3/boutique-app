@@ -1,0 +1,154 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_ACCOUNT_ID: "WILL_BE_REPLACED"
+    AWS_DEFAULT_REGION: "us-east-1"
+    IMAGE_REPO_PREFIX: "boutique"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      
+      - echo "Setting image tag..."
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:-latest}
+      - BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+      
+      - echo "Image tag: $IMAGE_TAG"
+      - echo "Build date: $BUILD_DATE"
+      
+  build:
+    commands:
+      - echo "Building Docker images..."
+      - |
+        # Define services to build
+        SERVICES="frontend cartservice productcatalogservice currencyservice paymentservice shippingservice emailservice checkoutservice recommendationservice adservice"
+        
+        # Create build summary
+        echo "Services to build: $(echo $SERVICES | wc -w)"
+        
+        for service in $SERVICES; do
+          echo "=========================================="
+          echo "Building $service..."
+          echo "=========================================="
+          
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:$IMAGE_TAG
+          
+          # Build image
+          docker build \
+            -t $IMAGE_URI \
+            --build-arg BUILD_DATE=$BUILD_DATE \
+            --build-arg VCS_REF=$COMMIT_HASH \
+            ./src/$service
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Failed to build $service"
+            exit 1
+          fi
+          
+          # Tag as latest
+          docker tag $IMAGE_URI $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:latest
+          
+          echo "✅ Built $service successfully"
+        done
+      
+      - echo "All images built successfully"
+      
+  post_build:
+    commands:
+      - echo "Scanning Docker images with Trivy..."
+      - |
+        SCAN_FAILURES=0
+        
+        for service in $SERVICES; do
+          echo "🔍 Scanning $service..."
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:$IMAGE_TAG
+          
+          # Comprehensive Trivy scan
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-image-$service.json \
+            $IMAGE_URI || true
+          
+          # Check for CRITICAL vulnerabilities
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-image-$service.json)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-image-$service.json)
+          
+          echo "  CRITICAL: $CRITICAL_COUNT, HIGH: $HIGH_COUNT"
+          
+          # Security context check: Must not run as root
+          USER=$(docker inspect $IMAGE_URI --format='{{.Config.User}}')
+          if [ -z "$USER" ] || [ "$USER" = "root" ] || [ "$USER" = "0" ]; then
+            echo "  ⚠️  WARNING: $service runs as root user"
+            # Don't fail for now, just warn
+          else
+            echo "  ✅ Running as user: $USER"
+          fi
+          
+          # Fail on CRITICAL vulnerabilities
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "  ❌ CRITICAL vulnerabilities found in $service"
+            jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | "    - \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion)"' trivy-image-$service.json | head -10
+            SCAN_FAILURES=$((SCAN_FAILURES + 1))
+          fi
+        done
+        
+        if [ "$SCAN_FAILURES" -gt 0 ]; then
+          echo "❌ Image scanning failed for $SCAN_FAILURES services"
+          echo "Please fix CRITICAL vulnerabilities before proceeding"
+          exit 1
+        fi
+      
+      - echo "Pushing images to ECR..."
+      - |
+        for service in $SERVICES; do
+          echo "📤 Pushing $service..."
+          IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:$IMAGE_TAG
+          
+          docker push $IMAGE_URI
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:latest
+          
+          echo "✅ Pushed $service"
+        done
+      
+      - echo "Creating image manifest..."
+      - |
+        cat > image-manifest.json <<MANIFEST_EOF
+{
+  "commit": "$COMMIT_HASH",
+  "build_date": "$BUILD_DATE",
+  "images": {
+MANIFEST_EOF
+        
+        FIRST=true
+        for service in $SERVICES; do
+          if [ "$FIRST" = true ]; then
+            FIRST=false
+          else
+            echo "," >> image-manifest.json
+          fi
+          echo "    \"$service\": \"$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_PREFIX-$service:$IMAGE_TAG\"" >> image-manifest.json
+        done
+        
+        cat >> image-manifest.json <<MANIFEST_EOF
+  }
+}
+MANIFEST_EOF
+        
+        cat image-manifest.json
+      
+      - echo "✅ Build and push completed successfully"
+
+artifacts:
+  files:
+    - trivy-image-*.json
+    - image-manifest.json
+  name: BuildArtifacts
+
+cache:
+  paths:
+    - '/root/.docker/**/*'

@@ -1,0 +1,126 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+      nodejs: 18
+      golang: 1.21
+    commands:
+      - echo "Installing dependency scanning tools..."
+      - pip3 install pip-audit safety
+      - npm install -g npm-audit-resolver
+      
+      # Install Trivy
+      - |
+        wget -q https://github.com/aquasecurity/trivy/releases/download/v0.48.0/trivy_0.48.0_Linux-64bit.tar.gz
+        tar zxf trivy_0.48.0_Linux-64bit.tar.gz
+        chmod +x trivy
+        mv trivy /usr/local/bin/
+        trivy --version
+      
+  build:
+    commands:
+      - echo "Scanning Python dependencies..."
+      - |
+        PYTHON_CRITICAL=0
+        for dir in src/*/; do
+          if [ -f "$dir/requirements.txt" ]; then
+            SERVICE=$(basename $dir)
+            echo "📦 Scanning $SERVICE (Python)..."
+            
+            # pip-audit scan
+            pip-audit -r $dir/requirements.txt \
+              --format json \
+              --output pip-audit-${SERVICE}.json 2>/dev/null || true
+            
+            # Count vulnerabilities
+            if [ -f "pip-audit-${SERVICE}.json" ]; then
+              CRITICAL=$(jq '[.dependencies[].vulns[] | select(.severity == "CRITICAL")] | length' pip-audit-${SERVICE}.json)
+              HIGH=$(jq '[.dependencies[].vulns[] | select(.severity == "HIGH")] | length' pip-audit-${SERVICE}.json)
+              
+              echo "  CRITICAL: $CRITICAL, HIGH: $HIGH"
+              PYTHON_CRITICAL=$((PYTHON_CRITICAL + CRITICAL))
+            fi
+          fi
+        done
+        
+        if [ "$PYTHON_CRITICAL" -gt 0 ]; then
+          echo "❌ Found $PYTHON_CRITICAL CRITICAL Python vulnerabilities"
+          exit 1
+        fi
+      
+      - echo "Scanning Node.js dependencies..."
+      - |
+        NODEJS_CRITICAL=0
+        for dir in src/*/; do
+          if [ -f "$dir/package.json" ]; then
+            SERVICE=$(basename $dir)
+            echo "📦 Scanning $SERVICE (Node.js)..."
+            
+            cd $dir
+            npm audit --json > ../../npm-audit-${SERVICE}.json 2>&1 || true
+            cd - > /dev/null
+            
+            if [ -f "npm-audit-${SERVICE}.json" ]; then
+              CRITICAL=$(jq '.metadata.vulnerabilities.critical // 0' npm-audit-${SERVICE}.json)
+              HIGH=$(jq '.metadata.vulnerabilities.high // 0' npm-audit-${SERVICE}.json)
+              
+              echo "  CRITICAL: $CRITICAL, HIGH: $HIGH"
+              NODEJS_CRITICAL=$((NODEJS_CRITICAL + CRITICAL))
+            fi
+          fi
+        done
+        
+        if [ "$NODEJS_CRITICAL" -gt 0 ]; then
+          echo "❌ Found $NODEJS_CRITICAL CRITICAL Node.js vulnerabilities"
+          exit 1
+        fi
+      
+      - echo "Scanning Go dependencies..."
+      - |
+        GO_HIGH=0
+        for dir in src/*/; do
+          if [ -f "$dir/go.mod" ]; then
+            SERVICE=$(basename $dir)
+            echo "📦 Scanning $SERVICE (Go)..."
+            
+            trivy fs --format json \
+              --severity HIGH,CRITICAL \
+              --output trivy-go-${SERVICE}.json \
+              $dir || true
+            
+            if [ -f "trivy-go-${SERVICE}.json" ]; then
+              VULNS=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH" or .Severity == "CRITICAL")] | length' trivy-go-${SERVICE}.json)
+              echo "  HIGH/CRITICAL: $VULNS"
+              GO_HIGH=$((GO_HIGH + VULNS))
+            fi
+          fi
+        done
+        
+        if [ "$GO_HIGH" -gt 10 ]; then
+          echo "⚠️  WARNING: Found $GO_HIGH HIGH/CRITICAL Go vulnerabilities (threshold: 10)"
+        fi
+      
+      - echo "Running comprehensive Trivy scan on entire codebase..."
+      - |
+        trivy fs --format json \
+          --severity HIGH,CRITICAL \
+          --output trivy-comprehensive.json \
+          src/ || true
+        
+        TOTAL_CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-comprehensive.json)
+        echo "Total CRITICAL vulnerabilities across all services: $TOTAL_CRITICAL"
+        
+        if [ "$TOTAL_CRITICAL" -gt 0 ]; then
+          echo "Critical vulnerabilities found:"
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL") | "  - \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")"' trivy-comprehensive.json
+        fi
+
+artifacts:
+  files:
+    - pip-audit-*.json
+    - npm-audit-*.json
+    - trivy-go-*.json
+    - trivy-comprehensive.json
+  name: DependencyScanArtifacts

@@ -1,0 +1,65 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Installing IaC scanning tools..."
+      - pip3 install checkov
+      
+  build:
+    commands:
+      - echo "Scanning Terraform files with Checkov..."
+      - |
+        if [ -d "../infra-boutique/terraform" ]; then
+          checkov --directory ../infra-boutique/terraform \
+            --output json \
+            --output-file checkov-report.json \
+            --soft-fail
+          
+          # Analyze results
+          FAILED_CHECKS=$(jq '.summary.failed' checkov-report.json)
+          PASSED_CHECKS=$(jq '.summary.passed' checkov-report.json)
+          
+          echo "IaC Scan Results:"
+          echo "  PASSED: $PASSED_CHECKS"
+          echo "  FAILED: $FAILED_CHECKS"
+          
+          # Extract critical misconfigurations
+          jq -r '.results.failed_checks[] | select(.severity == "HIGH" or .severity == "CRITICAL") | "  ❌ \(.check_id): \(.check_name) (\(.file_path))"' checkov-report.json > critical-iac-issues.txt
+          
+          if [ -s critical-iac-issues.txt ]; then
+            CRITICAL_COUNT=$(wc -l < critical-iac-issues.txt)
+            echo "Found $CRITICAL_COUNT critical IaC misconfigurations:"
+            cat critical-iac-issues.txt
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "❌ FAILED: Critical IaC security issues detected"
+              exit 1
+            fi
+          fi
+        else
+          echo "⚠️  No Terraform directory found, skipping IaC scan"
+        fi
+      
+      - echo "Scanning Kubernetes manifests..."
+      - |
+        if [ -d "kubernetes" ]; then
+          checkov --framework kubernetes \
+            --directory kubernetes \
+            --output json \
+            --output-file checkov-k8s-report.json \
+            --soft-fail
+          
+          echo "✅ Kubernetes manifest scan complete"
+        else
+          echo "No Kubernetes manifests found"
+        fi
+
+artifacts:
+  files:
+    - checkov-report.json
+    - checkov-k8s-report.json
+    - critical-iac-issues.txt
+  name: IaCArtifacts
